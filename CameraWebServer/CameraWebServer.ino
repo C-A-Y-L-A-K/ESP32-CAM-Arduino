@@ -2,6 +2,14 @@
 #include "esp_camera.h"
 #include <WiFi.h>
 
+// app_httpd.cpp'de tanimlanan fonksiyon ve pin sabitlerine erisim
+extern void setServoPosition(uint32_t pulse_us);
+#define BUZZER_PIN       14
+#define SERVO_PIN        15
+#define SERVO_FREQ       50
+#define SERVO_RES        16
+#define SERVO_CENTER_US  1500
+
 // ===========================
 // Select camera model in board_config.h
 // ===========================
@@ -10,8 +18,6 @@
 // ===========================
 // Enter your WiFi credentials
 // ===========================
-const char *ssid = "*****";          // Kamera ve uygulamanın aynı Ağa bağlı olması gerekmektedir.
-const char *password = "*****";     // Kameranın WiFi şifresi
 
 void startCameraServer();
 void setupLedFlash();
@@ -70,8 +76,9 @@ void setup() {
   }
 
 #if defined(CAMERA_MODEL_ESP_EYE)
-  pinMode(13, INPUT_PULLUP);
-  pinMode(14, INPUT_PULLUP);
+  // NOT: Biz bu modeli kullanmiyoruz, pin 14 bizde Buzzer icin kullaniliyor.
+  // pinMode(13, INPUT_PULLUP);
+  // pinMode(14, INPUT_PULLUP);
 #endif
 
   // camera init
@@ -119,6 +126,45 @@ void setup() {
   Serial.println("WiFi connected");
 
   startCameraServer();
+
+  // ============================================================
+  // --- ALARM DONANIMLARINI BASLAT ---
+  // ============================================================
+  // Buzzer: Standart dijital cikis (GPIO 14)
+  pinMode(BUZZER_PIN, OUTPUT);
+  digitalWrite(BUZZER_PIN, LOW); // Baslangicta sustur
+
+  // Servo: LEDC donanim PWM'i startCameraServer'DAN ONCE baslat
+  // (Kamera LEDC_TIMER_0 kullaniyor; servo farkli bir timer almali)
+  ledcAttach(SERVO_PIN, SERVO_FREQ, SERVO_RES);
+  setServoPosition(SERVO_CENTER_US);
+  delay(300);
+
+  startCameraServer();
+
+  // ---- BASLANGIC TARAMA SÜPÜRMESİ (sol -> sag -> merkez) ----
+  Serial.println("[SERVO]: Baslangic tarama surmesi basliyor...");
+
+  // Motor guc stabilizasyonu icin bekliyoruz
+  delay(1000);
+
+  // 1. Adim: Sol uca git ve yerles
+  setServoPosition(1000);
+  delay(800);
+
+  // 2. Adim: Sol uctan (1000µs) sag uca (2000µs) sur
+  // Adim: 50µs (~4.5 derece) | Gecikme: 60ms
+  // Toplam: (2000-1000)/50 = 20 adim x 60ms = ~1.2 saniye
+  for (uint32_t us = 1000; us <= 2000; us += 50) {
+    setServoPosition(us);
+    delay(60);
+  }
+  delay(400);
+
+  // 3. Adim: Sag uctan merkeze (1500µs) don
+  setServoPosition(SERVO_CENTER_US);
+  delay(600);
+  Serial.println("[SERVO]: Tarama tamamlandi. Merkez konumda bekleniyor.");
 
   Serial.print("Camera Ready! Use 'http://");
   Serial.print(WiFi.localIP());

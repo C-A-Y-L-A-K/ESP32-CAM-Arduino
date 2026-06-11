@@ -23,6 +23,30 @@
 #include "camera_index.h"
 #include "board_config.h"
 
+// =============================================
+// --- ALARM PIN TANIMLARI (Arduino Yok) ---
+// =============================================
+#define BUZZER_PIN   14   // Buzzer sinyali (uzun bacak)
+#define SERVO_PIN    15   // Servo motor sinyal pini
+
+// Servo PWM ayarları (50 Hz, 16-bit çözünürlük)
+#define SERVO_FREQ       50
+#define SERVO_RES        16
+#define SERVO_CENTER_US  1500  // 90 derece (merkez) - mikrosaniye
+#define SERVO_ALERT_US   2000  // ~180 derece (alarm konumu) - mikrosaniye
+
+// Mikrosaniye -> LEDC duty değerine çevirme yardımcı makrosu
+// Periyot = 1/50Hz = 20ms = 20000us; 16-bit -> 65536 adım
+#define US_TO_DUTY(us) ((uint32_t)((us) * 65536UL / 20000UL))
+
+// Global alarm durumu
+volatile bool alarm_state = false;
+
+// Servo'yu belirli bir mikrosaniye konumuna taşı
+void setServoPosition(uint32_t pulse_us) {
+  ledcWrite(SERVO_PIN, US_TO_DUTY(pulse_us));
+}
+
 #if defined(ARDUINO_ARCH_ESP32) && defined(CONFIG_ARDUHAL_ESP_LOG)
 #include "esp32-hal-log.h"
 #endif
@@ -101,6 +125,94 @@ void enable_led(bool en) {  // Turn LED On or Off
   log_i("Set LED intensity to %d", duty);
 }
 #endif
+
+// parse_get fonksiyonu asagida tanimlanmistir, onceden bildiriyoruz
+static esp_err_t parse_get(httpd_req_t *req, char **obuf);
+
+// =============================================
+// --- ALARM HTTP HANDLER ---
+// GET /alarm?state=1  -> Alarm Açık
+// GET /alarm?state=0  -> Alarm Kapalı
+// =============================================
+static esp_err_t alarm_handler(httpd_req_t *req) {
+  char *buf = NULL;
+  char state_val[4];
+
+  if (parse_get(req, &buf) != ESP_OK) {
+    return ESP_FAIL;
+  }
+
+  if (httpd_query_key_value(buf, "state", state_val, sizeof(state_val)) != ESP_OK) {
+    free(buf);
+    httpd_resp_send_404(req);
+    return ESP_FAIL;
+  }
+  free(buf);
+
+  int state = atoi(state_val);
+  alarm_state = (state == 1);
+
+  if (alarm_state) {
+    // --- ALARM AÇ ---
+    digitalWrite(BUZZER_PIN, HIGH);          // Buzzer'ı çalıştır
+    setServoPosition(SERVO_ALERT_US);        // Servo'yu alarm konumuna döndür
+    log_i("[ALARM]: AKTIF - Buzzer ve Servo devrede!");
+  } else {
+    // --- ALARM KAPAT ---
+    digitalWrite(BUZZER_PIN, LOW);           // Buzzer'ı sustur
+    setServoPosition(SERVO_CENTER_US);       // Servo'yu merkeze döndür
+    log_i("[ALARM]: PASİF - Sistem normal.");
+  }
+
+  httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+  httpd_resp_set_type(req, "application/json");
+  char resp[32];
+  snprintf(resp, sizeof(resp), "{\"alarm\":%d}", alarm_state ? 1 : 0);
+  return httpd_resp_send(req, resp, strlen(resp));
+}
+
+// =============================================
+// --- SERVO MANUEL KONTROL HTTP HANDLER ---
+// GET /servo?pos=<mikrosaniye>
+// Ornek: /servo?pos=1000  -> sol
+//        /servo?pos=1500  -> merkez
+//        /servo?pos=2000  -> sag
+// =============================================
+static esp_err_t servo_handler(httpd_req_t *req) {
+  char *buf = NULL;
+  char pos_val[8];
+
+  if (parse_get(req, &buf) != ESP_OK) {
+    return ESP_FAIL;
+  }
+
+  if (httpd_query_key_value(buf, "pos", pos_val, sizeof(pos_val)) != ESP_OK) {
+    free(buf);
+    httpd_resp_send_404(req);
+    return ESP_FAIL;
+  }
+  free(buf);
+
+  uint32_t pos = (uint32_t)atoi(pos_val);
+
+  // Guvenlik siniri: 500us - 2500us arasinda tut
+  if (pos < 500)  pos = 500;
+  if (pos > 2500) pos = 2500;
+
+  // Alarm aktifken servo konumu alarm handler'a birakilir
+  if (!alarm_state) {
+    setServoPosition(pos);
+    log_i("[SERVO]: Manuel konum -> %u us", pos);
+  } else {
+    log_i("[SERVO]: Alarm aktif, manuel komut yoksayildi.");
+  }
+
+  httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+  httpd_resp_set_type(req, "application/json");
+  char resp[32];
+  snprintf(resp, sizeof(resp), "{\"pos\":%u}", pos);
+  return httpd_resp_send(req, resp, strlen(resp));
+}
 
 static esp_err_t bmp_handler(httpd_req_t *req) {
   camera_fb_t *fb = NULL;
@@ -674,7 +786,7 @@ static esp_err_t index_handler(httpd_req_t *req) {
 
 void startCameraServer() {
   httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-  config.max_uri_handlers = 16;
+  config.max_uri_handlers = 18; // +1 alarm, +1 servo
 
   httpd_uri_t index_uri = {
     .uri = "/",
@@ -834,6 +946,36 @@ void startCameraServer() {
     httpd_register_uri_handler(camera_httpd, &greg_uri);
     httpd_register_uri_handler(camera_httpd, &pll_uri);
     httpd_register_uri_handler(camera_httpd, &win_uri);
+
+    // --- /alarm uç noktasını kaydet ---
+    httpd_uri_t alarm_uri = {
+      .uri     = "/alarm",
+      .method  = HTTP_GET,
+      .handler = alarm_handler,
+      .user_ctx = NULL
+#ifdef CONFIG_HTTPD_WS_SUPPORT
+      ,
+      .is_websocket = true,
+      .handle_ws_control_frames = false,
+      .supported_subprotocol = NULL
+#endif
+    };
+    httpd_register_uri_handler(camera_httpd, &alarm_uri);
+
+    // --- /servo uc noktasini kaydet ---
+    httpd_uri_t servo_uri = {
+      .uri     = "/servo",
+      .method  = HTTP_GET,
+      .handler = servo_handler,
+      .user_ctx = NULL
+#ifdef CONFIG_HTTPD_WS_SUPPORT
+      ,
+      .is_websocket = true,
+      .handle_ws_control_frames = false,
+      .supported_subprotocol = NULL
+#endif
+    };
+    httpd_register_uri_handler(camera_httpd, &servo_uri);
   }
 
   config.server_port += 1;
