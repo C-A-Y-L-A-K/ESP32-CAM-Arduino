@@ -41,17 +41,43 @@
 
 // Global alarm durumu
 volatile bool alarm_state = false;
+volatile bool auto_scan_state = true; // Otomatik tarama baslangicta acik
+
+// =============================================
+// --- UZAKTAN DEBUG LOG SİSTEMİ ---
+// =============================================
+String debug_log_buffer = "";
+void add_debug_log(String msg) {
+  debug_log_buffer += msg + "\n";
+  if (debug_log_buffer.length() > 1000) {
+    debug_log_buffer = debug_log_buffer.substring(debug_log_buffer.length() - 800); // Sadece en son kısmı sakla
+  }
+}
+
+// Özel log yazdırma makrosu
+#define UZAKTAN_LOG(msg) do { \
+  log_i(msg); \
+  add_debug_log(String(msg)); \
+} while(0)
+
+#define UZAKTAN_LOGF(fmt, ...) do { \
+  log_i(fmt, ##__VA_ARGS__); \
+  char temp_buf[128]; \
+  snprintf(temp_buf, sizeof(temp_buf), fmt, ##__VA_ARGS__); \
+  add_debug_log(String(temp_buf)); \
+} while(0)
 
 // Servo'yu belirli bir mikrosaniye konumuna taşı
 void setServoPosition(uint32_t pulse_us) {
+  UZAKTAN_LOGF("[DEBUG-MOTOR] setServoPosition BASLADI: Hedef PWM(us) = %u", pulse_us);
   ledcWrite(SERVO_PIN, US_TO_DUTY(pulse_us));
+  UZAKTAN_LOG("[DEBUG-MOTOR] setServoPosition BITTI: ledcWrite tamamlandi");
 }
 
 #if defined(ARDUINO_ARCH_ESP32) && defined(CONFIG_ARDUHAL_ESP_LOG)
 #include "esp32-hal-log.h"
 #endif
 
-// LED FLASH setup
 #if defined(LED_GPIO_NUM)
 #define CONFIG_LED_MAX_INTENSITY 255
 
@@ -59,6 +85,8 @@ int led_duty = 0;
 bool isStreaming = false;
 
 #endif
+
+
 
 typedef struct {
   httpd_req_t *req;
@@ -156,18 +184,54 @@ static esp_err_t alarm_handler(httpd_req_t *req) {
     // --- ALARM AÇ ---
     digitalWrite(BUZZER_PIN, HIGH);          // Buzzer'ı çalıştır
     setServoPosition(SERVO_ALERT_US);        // Servo'yu alarm konumuna döndür
-    log_i("[ALARM]: AKTIF - Buzzer ve Servo devrede!");
+    UZAKTAN_LOG("[ALARM]: AKTIF - Buzzer ve Servo devrede!");
   } else {
     // --- ALARM KAPAT ---
     digitalWrite(BUZZER_PIN, LOW);           // Buzzer'ı sustur
     setServoPosition(SERVO_CENTER_US);       // Servo'yu merkeze döndür
-    log_i("[ALARM]: PASİF - Sistem normal.");
+    UZAKTAN_LOG("[ALARM]: PASİF - Sistem normal.");
   }
 
   httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
   httpd_resp_set_type(req, "application/json");
   char resp[32];
   snprintf(resp, sizeof(resp), "{\"alarm\":%d}", alarm_state ? 1 : 0);
+  return httpd_resp_send(req, resp, strlen(resp));
+}
+
+// =============================================
+// --- OTOMATIK TARAMA KONTROL HTTP HANDLER ---
+// GET /scan?state=1  -> Tarama Acik
+// GET /scan?state=0  -> Tarama Kapali
+// =============================================
+static esp_err_t scan_handler(httpd_req_t *req) {
+  char *buf = NULL;
+  char state_val[4];
+
+  if (parse_get(req, &buf) != ESP_OK) {
+    return ESP_FAIL;
+  }
+
+  if (httpd_query_key_value(buf, "state", state_val, sizeof(state_val)) != ESP_OK) {
+    free(buf);
+    httpd_resp_send_404(req);
+    return ESP_FAIL;
+  }
+  free(buf);
+
+  int state = atoi(state_val);
+  auto_scan_state = (state == 1);
+
+  if (auto_scan_state) {
+    UZAKTAN_LOG("[SERVO]: Otomatik tarama AKTIF edildi.");
+  } else {
+    UZAKTAN_LOG("[SERVO]: Otomatik tarama DURDURULDU.");
+  }
+
+  httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+  httpd_resp_set_type(req, "application/json");
+  char resp[32];
+  snprintf(resp, sizeof(resp), "{\"scan\":%d}", auto_scan_state ? 1 : 0);
   return httpd_resp_send(req, resp, strlen(resp));
 }
 
@@ -201,10 +265,12 @@ static esp_err_t servo_handler(httpd_req_t *req) {
 
   // Alarm aktifken servo konumu alarm handler'a birakilir
   if (!alarm_state) {
+    UZAKTAN_LOGF("[DEBUG-MOTOR] servo_handler: Manuel servo komutu uygulaniyor: %u us", pos);
     setServoPosition(pos);
-    log_i("[SERVO]: Manuel konum -> %u us", pos);
+    UZAKTAN_LOGF("[SERVO]: Manuel konum -> %u us", pos);
   } else {
-    log_i("[SERVO]: Alarm aktif, manuel komut yoksayildi.");
+    UZAKTAN_LOG("[DEBUG-MOTOR] servo_handler: Alarm aktif, manuel komut REDDEDILDI.");
+    UZAKTAN_LOG("[SERVO]: Alarm aktif, manuel komut yoksayildi.");
   }
 
   httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
@@ -212,6 +278,19 @@ static esp_err_t servo_handler(httpd_req_t *req) {
   char resp[32];
   snprintf(resp, sizeof(resp), "{\"pos\":%u}", pos);
   return httpd_resp_send(req, resp, strlen(resp));
+}
+
+// =============================================
+// --- LOG GÖRÜNTÜLEME HTTP HANDLER ---
+// GET /log -> Son debug loglarini dondurur
+// =============================================
+static esp_err_t log_read_handler(httpd_req_t *req) {
+  httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+  httpd_resp_set_type(req, "text/plain");
+  esp_err_t res = httpd_resp_send(req, debug_log_buffer.c_str(), debug_log_buffer.length());
+  // Okunduktan sonra tamponu temizle ki ayni loglar tekrar tekrar gorunmesin
+  debug_log_buffer = "";
+  return res;
 }
 
 static esp_err_t bmp_handler(httpd_req_t *req) {
@@ -961,6 +1040,37 @@ void startCameraServer() {
 #endif
     };
     httpd_register_uri_handler(camera_httpd, &alarm_uri);
+
+    // --- /log uç noktasını kaydet ---
+    httpd_uri_t log_uri = {
+      .uri     = "/log",
+      .method  = HTTP_GET,
+      .handler = log_read_handler,
+      .user_ctx = NULL
+#ifdef CONFIG_HTTPD_WS_SUPPORT
+      ,
+      .is_websocket = true,
+      .handle_ws_control_frames = false,
+      .supported_subprotocol = NULL
+#endif
+    };
+    httpd_register_uri_handler(camera_httpd, &log_uri);
+
+    // --- /scan uc noktasini kaydet ---
+    httpd_uri_t scan_uri = {
+      .uri     = "/scan",
+      .method  = HTTP_GET,
+      .handler = scan_handler,
+      .user_ctx = NULL
+#ifdef CONFIG_HTTPD_WS_SUPPORT
+      ,
+      .is_websocket = true,
+      .handle_ws_control_frames = false,
+      .supported_subprotocol = NULL
+#endif
+    };
+    httpd_register_uri_handler(camera_httpd, &scan_uri);
+
 
     // --- /servo uc noktasini kaydet ---
     httpd_uri_t servo_uri = {

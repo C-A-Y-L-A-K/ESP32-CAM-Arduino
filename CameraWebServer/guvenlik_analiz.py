@@ -13,6 +13,8 @@ url         = f'http://{esp32_ip}:81/stream'      # Video akışının çekilece
 control_url = f'http://{esp32_ip}/control'        # Flaş kontrolü için HTTP adresi
 alarm_url   = f'http://{esp32_ip}/alarm'          # Alarm kontrolü için HTTP adresi
 servo_url   = f'http://{esp32_ip}/servo'          # Manuel servo kontrolü için HTTP adresi
+log_url     = f'http://{esp32_ip}/log'            # ESP32 uzaktan debug logları için HTTP adresi
+scan_url    = f'http://{esp32_ip}/scan'           # Otomatik tarama kontrolü için HTTP adresi
 
 # ==============================================================================
 # --- SİSTEM DURUM DEĞİŞKENLERİ ---
@@ -23,8 +25,8 @@ manuel_alarm  = False  # 's' tuşu ile kontrol edilir (Manuel test sireni)
 
 # Servo manuel kontrol değişkenleri
 servo_pos     = 1500   # Başlangıç konumu: merkez (1500µs = 90°)
-SERVO_MIN     = 1000   # Sol sınır (~45°)
-SERVO_MAX     = 2000   # Sağ sınır (~135°)
+SERVO_MIN     = 500    # Sol sınır (~0°)
+SERVO_MAX     = 2500   # Sağ sınır (~180°)
 SERVO_ADIM    = 100    # Her tuş basışında kaç µs kayacak
 
 fps_baslangic_zamani = 0  # FPS hesaplama için zaman tutucu
@@ -88,6 +90,41 @@ def servo_gonder_async(pos_us):
     """servo_gonder fonksiyonunu arka planda ayrı thread ile çağırır."""
     t = threading.Thread(target=servo_gonder, args=(pos_us,), daemon=True)
     t.start()
+
+# ==============================================================================
+# FONKSİYON: ESP32 OTOMATİK TARAMA DURUMUNU DEĞİŞTİR
+# ==============================================================================
+def scan_gonder(durum):
+    """ESP32'deki /scan uç noktasına HTTP GET isteği göndererek otomatik taramayı açar/kapatır."""
+    try:
+        state_val = 1 if durum else 0
+        requests.get(f"{scan_url}?state={state_val}", timeout=2)
+    except Exception as e:
+        print(f"[HATA LOG]: Tarama komutu gönderilemedi! Detay: {e}")
+
+def scan_gonder_async(durum):
+    t = threading.Thread(target=scan_gonder, args=(durum,), daemon=True)
+    t.start()
+
+# ==============================================================================
+# FONKSİYON: ESP32'DEN UZAKTAN DEBUG LOGLARINI ÇEK
+# ==============================================================================
+def log_cek_dongusu():
+    """Arka planda saniyede bir ESP32'nin /log uç noktasını kontrol eder ve yeni logları ekrana basar."""
+    while True:
+        try:
+            r = requests.get(log_url, timeout=2)
+            if r.status_code == 200 and r.text.strip():
+                for line in r.text.strip().split('\n'):
+                    if line.strip():
+                        print(f"[ESP32 C++ LOG]: {line.strip()}")
+        except Exception:
+            pass # Bağlantı hatası durumunda sessizce geç
+        time.sleep(1) # Saniyede 1 kez sorgula
+
+t_log = threading.Thread(target=log_cek_dongusu, daemon=True)
+t_log.start()
+print("[AĞ LOG]: ESP32 C++ Uzaktan Debug Log servisi dinleniyor...")
 
 # ==============================================================================
 # 2. ADIM: VİDEO AKIŞ DÖNGÜSÜ VE ANALİZ
@@ -237,20 +274,27 @@ while True:
                 elif key == ord('a'): # MANUEL ANALİZ KONTROLÜ
                     analiz_aktif = not analiz_aktif
                     print(f"[SİSTEM LOG]: Otonom analiz -> {'AKTİFLEŞTİRİLDİ' if analiz_aktif else 'DURDURULDU'}")
+                    scan_gonder_async(analiz_aktif) # ESP32'ye tarama komutunu gönder
                     
                 elif key == ord('s'): # MANUEL SİREN/ALARM KONTROLÜ
                     manuel_alarm = not manuel_alarm
                     print(f"[SİSTEM LOG]: Manuel alarm -> {'AKTİF' if manuel_alarm else 'PASİF'}")
 
                 elif key == ord('z'): # SERVO SAGA DÖNDÜR
-                    servo_pos = min(servo_pos + SERVO_ADIM, SERVO_MAX)
-                    print(f"[SERVO LOG]: Sağa -> {servo_pos}µs")
-                    servo_gonder_async(servo_pos)
+                    if not analiz_aktif:
+                        servo_pos = min(servo_pos + SERVO_ADIM, SERVO_MAX)
+                        print(f"[SERVO LOG]: Sağa -> {servo_pos}µs")
+                        servo_gonder_async(servo_pos)
+                    else:
+                        print("[UYARI]: Analiz açıkken manuel servo kontrolü kapalıdır!")
 
                 elif key == ord('x'): # SERVO SOLA DÖNDÜR
-                    servo_pos = max(servo_pos - SERVO_ADIM, SERVO_MIN)
-                    print(f"[SERVO LOG]: Sola -> {servo_pos}µs")
-                    servo_gonder_async(servo_pos)
+                    if not analiz_aktif:
+                        servo_pos = max(servo_pos - SERVO_ADIM, SERVO_MIN)
+                        print(f"[SERVO LOG]: Sola -> {servo_pos}µs")
+                        servo_gonder_async(servo_pos)
+                    else:
+                        print("[UYARI]: Analiz açıkken manuel servo kontrolü kapalıdır!")
 
         break
     except Exception as e:

@@ -11,12 +11,12 @@ extern void setServoPosition(uint32_t pulse_us);
 #define SERVO_CENTER_US  1500
 
 // ===========================
-// Select camera model in board_config.h
+// Kamera modelini board_config.h dosyasindan secin
 // ===========================
 #include "board_config.h"
 
 // ===========================
-// Enter your WiFi credentials
+// WiFi bilgilerinizi girin
 // ===========================
 
 void startCameraServer();
@@ -55,21 +55,21 @@ void setup() {
   config.jpeg_quality = 12;
   config.fb_count = 1;
 
-  // if PSRAM IC present, init with UXGA resolution and higher JPEG quality
-  //                      for larger pre-allocated frame buffer.
+  // Eger PSRAM entegresi varsa, daha buyuk on bellek tahsisi icin
+  // UXGA cozunurlugu ve daha yuksek JPEG kalitesi ile baslat.
   if (config.pixel_format == PIXFORMAT_JPEG) {
     if (psramFound()) {
       config.jpeg_quality = 10;
       config.fb_count = 2;
       config.grab_mode = CAMERA_GRAB_LATEST;
     } else {
-      // Limit the frame size when PSRAM is not available
+      // PSRAM yoksa cerceve boyutunu sinirla
       config.frame_size = FRAMESIZE_SVGA;
       config.fb_location = CAMERA_FB_IN_DRAM;
     }
   } else {
-    // Best option for face detection/recognition
-    config.frame_size = FRAMESIZE_240X240;
+      // Yuz algilama/tanima icin en iyi secenek
+      config.frame_size = FRAMESIZE_240X240;
 #if CONFIG_IDF_TARGET_ESP32S3
     config.fb_count = 2;
 #endif
@@ -81,21 +81,21 @@ void setup() {
   // pinMode(14, INPUT_PULLUP);
 #endif
 
-  // camera init
+  // Kamerayi baslat
   esp_err_t err = esp_camera_init(&config);
   if (err != ESP_OK) {
-    Serial.printf("Camera init failed with error 0x%x", err);
+    Serial.printf("Kamera baslatilamadi, hata kodu 0x%x", err);
     return;
   }
 
   sensor_t *s = esp_camera_sensor_get();
-  // initial sensors are flipped vertically and colors are a bit saturated
+  // ilk sensorler dikey olarak ters cevrilmistir ve renkler biraz doygun olabilir
   if (s->id.PID == OV3660_PID) {
-    s->set_vflip(s, 1);        // flip it back
-    s->set_brightness(s, 1);   // up the brightness just a bit
-    s->set_saturation(s, -2);  // lower the saturation
+    s->set_vflip(s, 1);        // geri dondur
+    s->set_brightness(s, 1);   // parlakligi biraz artir
+    s->set_saturation(s, -2);  // doygunlugu azalt
   }
-  // drop down frame size for higher initial frame rate
+  // daha yuksek baslangic kare hizi icin cerceve boyutunu dusur
   if (config.pixel_format == PIXFORMAT_JPEG) {
     s->set_framesize(s, FRAMESIZE_QVGA);
   }
@@ -109,7 +109,7 @@ void setup() {
   s->set_vflip(s, 1);
 #endif
 
-// Setup LED FLash if LED pin is defined in camera_pins.h
+// Eger camera_pins.h icinde LED pini tanimlanmissa LED Flas'i kur
 #if defined(LED_GPIO_NUM)
   setupLedFlash();
 #endif
@@ -117,13 +117,13 @@ void setup() {
   WiFi.begin(ssid, password);
   WiFi.setSleep(false);
 
-  Serial.print("WiFi connecting");
+  Serial.print("WiFi baglaniyor");
   while (WiFi.status() != WL_CONNECTED) {
     delay(500);
     Serial.print(".");
   }
   Serial.println("");
-  Serial.println("WiFi connected");
+  Serial.println("WiFi baglandi");
 
   startCameraServer();
 
@@ -166,12 +166,41 @@ void setup() {
   delay(600);
   Serial.println("[SERVO]: Tarama tamamlandi. Merkez konumda bekleniyor.");
 
-  Serial.print("Camera Ready! Use 'http://");
+  Serial.print("Kamera Hazir! Baglanmak icin 'http://");
   Serial.print(WiFi.localIP());
-  Serial.println("' to connect");
+  Serial.println("' adresini kullanin");
 }
 
+extern volatile bool alarm_state;
+extern volatile bool auto_scan_state;
+
 void loop() {
-  // Do nothing. Everything is done in another task by the web server
-  delay(10000);
+  if (!alarm_state && auto_scan_state) {
+    Serial.println("[DEBUG-MOTOR] Tarama dongusu basliyor: Sol -> Sag");
+    // Sol uçtan (500us) sağ uca (2500us) tarama
+    for (uint32_t us = 500; us <= 2500; us += 50) {
+      if (alarm_state || !auto_scan_state) {
+        Serial.println("[DEBUG-MOTOR] Tarama kesildi!");
+        break;
+      }
+      setServoPosition(us);
+      delay(60);
+    }
+    
+    if (!alarm_state && auto_scan_state) {
+      Serial.println("[DEBUG-MOTOR] Tarama dongusu donuyor: Sag -> Sol");
+      // Sağ uçtan (2500us) sol uca (500us) geri dönüş
+      for (uint32_t us = 2500; us >= 500; us -= 50) {
+        if (alarm_state || !auto_scan_state) {
+          Serial.println("[DEBUG-MOTOR] Tarama kesildi!");
+          break;
+        }
+        setServoPosition(us);
+        delay(60);
+      }
+    }
+  } else {
+    // Alarm aktifse veya tarama kapalıysa bekle
+    delay(500);
+  }
 }
