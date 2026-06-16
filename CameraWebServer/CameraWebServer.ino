@@ -18,10 +18,9 @@ extern void setServoPosition(uint32_t pulse_us);
 // ===========================
 // WiFi bilgilerinizi girin
 // ===========================
-<<<<<<< Updated upstream
+
 const char *ssid = "*****";          // Kamera ve uygulamanın aynı Ağa bağlı olması gerekmektedir.
 const char *password = "*****";      // Kameranın WiFi şifresi
-=======
 
 void startCameraServer();
 void setupLedFlash();
